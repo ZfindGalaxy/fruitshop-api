@@ -1,33 +1,55 @@
+# ======================
 # Python
+# ======================
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Local environment variables
-.env
+# ======================
+# Sensitive files
+# ======================
+.env                  # ← 绝对不要提交！
+.env.local
+.env.*.local
 
-# Logs and local databases
+# ======================
+# Logs and databases
+# ======================
 *.log
 *.sqlite3
 *.db
+FruitAndVegertable.db  # ← 防止你的默认 SQLite 文件被提交
 
-# Virtual environments
+# ======================
+# Virtual Environments
+# ======================
+# Generic
 venv/
 ENV/
 env/
 .venv/
 
+# Anaconda (usually outside project, but just in case)
+anaconda*/
+miniconda*/
+
+# ======================
 # Flask
+# ======================
 instance/
 .webassets-cache
 
-# VS Code
+# ======================
+# VS Code (keep useful configs)
+# ======================
 .vscode/
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
 
-# System files
+# ======================
+# System
+# ======================
 .DS_Store
 Thumbs.db
