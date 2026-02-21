@@ -3,7 +3,7 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import MetaData,Text, Float,ForeignKey
 from datetime import datetime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-
+from flask_login import UserMixin
 
 # 定义命名约定的Base类
 class Base(DeclarativeBase):
@@ -23,7 +23,7 @@ db = SQLAlchemy(model_class=Base)
 
 # 设计表格，表格一：用户数据，用于登录，注册，修改，注销等功能的实现对应表格，用于储存用户账号和密码
 # users：Password and Account
-class Users(db.Model):
+class Users(db.Model, UserMixin):
     __tablename__ = 'users'
     id:Mapped[int] = mapped_column(db.Integer,primary_key = True, autoincrement= True)
     account:Mapped[str] = mapped_column(db.String(11),nullable=False,unique=True)
