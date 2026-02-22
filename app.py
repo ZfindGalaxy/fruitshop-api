@@ -4,7 +4,7 @@ import os   #实现交互
 from models import db
 from flask_migrate import Migrate
 from dotenv import load_dotenv
-
+from datetime import timedelta
 
 #初始化flask应用
 app = Flask(__name__)
@@ -18,7 +18,8 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
 )
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['DEBUG'] = os.environ.get('DEBUG', 'False').lower() == 'true'
-
+# 用户一小时为操作自动登出
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=1) 
 
 #初始化数据库
 db.init_app(app) # 复用models.py中的db实例
@@ -29,7 +30,7 @@ from models import Users, FruitVariety, Details
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash   # 密码加密和安全
 from sqlalchemy import or_
-from datetime import timedelta
+
 login_manager = LoginManager()
 login_manager.init_app(app) # 初始化登录功能，绑定到flask——app
 login_manager.login_view = 'login'  # 未登录时重定向到login视图函数
@@ -103,9 +104,76 @@ def register():
     return success(message="注册成功")
 
     
-# 注销功能
+# 登出功能
+@app.route('/api/logout', methods = ['POST'])
+# 装饰器：必须登录才可以范文的路由，未登陆就进行跳转
+@login_required
+def logout():
+    logout_user()
+    return success(message='已登出')
+
+# 注销(删除账号)功能
+@app.route('/api/delete-account')
+@login_required
+def delete_account():
+    data = request.get_json()
+    password_3 = data.get('password')
+
+    # 密码验证
+    if not password_3 or not check_password_hash(current_user.password, password_3):
+        return error(message= '密码验证失败，无法注销账号', code = 400)
+    # 验证成功后，先登出后清理账号
+    logout_user()
+    # 尝试删除账号
+    try:
+        db.session.delete(current_user)
+        db.session.commit()
+        return success(message='账号注销成功')
+    except Exception as e:
+        db.session.rollback() # 撤销工作台里所有未提交的操作，恢复到操作前的状态
+        return error(message=f'账号注销失败:{str(e)}',code = 500)
+
+
 # 密码修改功能
-# 果蔬详情页——已（未）登录
+@app.route('/api/change-password',methods = ['PATCH'])
+@login_required
+def change_password():
+    data = request.get_json()
+    old_password = data.get('old_password')
+    new_password = data.get('new_password')
+    # 密码验证
+    if not new_password:
+        return error(message= '新密码不能为空', code = 400)
+    if not old_password or not check_password_hash(current_user.password, old_password):
+        return error(message= '密码验证失败，无法修改密码', code = 400)
+    current_user.password = generate_password_hash(new_password)
+    db.session.commit()
+    logout_user()
+    return success(message='密码修改成功，请重新登录')
+
+# 果蔬首页——已（未）登录
+@app.route('/api/fruits', methods = ['GET'])
+def get_fruits_and_vegetables():
+    per_page = 10 # 每一页10条信息
+    # 页码信息
+    page = request.args.get('page',1 , type=int)
+    # 分页查询
+    pagination = FruitVariety.query.paginate(page=page, per_page=per_page, error_out=False)
+    # 转字典
+    fruits = [f.to_dict() for f in pagination.items]
+    return success({
+        'fruits': fruits,
+        'total': pagination.total,  # 总记录数
+        'pages': pagination.pages,  # 总页数
+        'current_page': page,  # 当前页码
+        'has_next': pagination.has_next,   # 是否有下一页（True/False）
+        'has_prev': pagination.has_prev    # 是否有上一页
+    })
+
+# 果蔬详情页
+
+
+
 # 根据果蔬名称模糊查询功能
 # 种类添加功能
 # 种类删除功能
