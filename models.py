@@ -51,7 +51,7 @@ class FruitVariety(db.Model):
             'id': self.id,
             'category': self.category,
             'name': self.name,
-            'detail': self.detail.to_dict() if self.detail else None
+            'detail': self.detail.to_dict() if self.detail else None    # 把表三的数据主动嵌套进表二的返回结果里
         }
 
 
