@@ -140,16 +140,20 @@ def logout():
 @login_required
 def delete_account():
     password_3 = request.args.get('password')
+    user_delete = Users.query.get(current_user.id)
 
+    if not user_delete:
+        return error(message='用户不存在', code=404)
     # 密码验证
     if not password_3 or not check_password_hash(current_user.password, password_3):
         return error(message= '密码验证失败，无法注销账号', code = 400)
-    # 验证成功后，先登出后清理账号
-    logout_user()
+
     # 尝试删除账号
     try:
-        db.session.delete(current_user)
+        db.session.delete(user_delete)
         db.session.commit()
+        # 验证成功后，先清理账号后登出
+        logout_user()
         return success(message='账号注销成功')
     except Exception as e:
         db.session.rollback() # 撤销工作台里所有未提交的操作，恢复到操作前的状态
@@ -230,7 +234,7 @@ def search():
         FruitVariety.category.like(f"%{q}%")
         )
     ).all()
-    pagination = FruitVariety.query.pagination(page = page, per_page = per_page, error_out = False)
+    pagination = FruitVariety.query.paginate(page = page, per_page = per_page, error_out = False)
     return success({
         'results':[r.to_dict() for r in results],
         'current_page':page,
