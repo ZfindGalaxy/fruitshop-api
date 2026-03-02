@@ -37,6 +37,7 @@ from models import Users, FruitVariety, Details
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user
 from werkzeug.security import generate_password_hash, check_password_hash   # 密码加密和安全
 from sqlalchemy import or_
+import re
 
 login_manager = LoginManager()
 login_manager.init_app(app) # 初始化登录功能，绑定到flask——app
@@ -60,6 +61,22 @@ def error(message = 'Error', code = 400):
         'code':code,
         'message':message
     }),code
+
+# 密码验证函数设计
+"""
+数字、大写字母、小写字母的混合,而且字符数要等于8个
+新增一个验证函数validate_password
+"""
+def validate_password(password:str)->bool:
+    if not re.search(r'\d', password):
+        return False
+    if not re.search(r'[a-z]', password):
+        return False
+    if not re.search(r'[A-Z]', password):
+        return False
+    if len(password) != 8:
+        return False
+    return True
 
 # 路由设计
 
@@ -108,20 +125,20 @@ def login():
 @app.route('/api/register',methods = ['POST'])
 def register():
     data = request.get_json()
-    account_2 = data.get('account')
-    password_2 = data.get('password')
+    account = data.get('account')
+    password = data.get('password')
 
-    if not account_2 or not password_2:
+    if not account or not password:
         return error('账号和密码不能未空',400)
-    if len(account_2) != 11 or not account_2.isdigit():
+    if len(account) != 11 or not account.isdigit():
         return error("账号必须是11位数字", 400)
-    if len(password_2) < 8:
-        return error("密码长度不能低于8位", 400)
-    if Users.query.filter_by(account=account_2).first():
+    if not validate_password(password):
+        return {"error": "密码必须为8位，且包含大小写字母和数字"}, 400
+    if Users.query.filter_by(account=account).first():
         return error("账号已存在", 409)        
              
-    hashed_pw = generate_password_hash(password_2)
-    new_user = Users(account=account_2, password=hashed_pw)
+    hashed_pw = generate_password_hash(password)
+    new_user = Users(account=account, password=hashed_pw)
     db.session.add(new_user)
     db.session.commit()
     return success(message="注册成功")
@@ -170,8 +187,8 @@ def change_password():
     # 密码验证
     if not new_password:
         return error(message= '新密码不能为空', code = 400)
-    if len(new_password)< 8:
-        return error(message='密码不能低于8位', code=400)
+    if not validate_password(new_password):
+        return error(message= '密码必须为8位，且包含大小写字母和数字', code = 400)
     if not old_password or not check_password_hash(current_user.password, old_password):
         return error(message= '密码验证失败，无法修改密码', code = 400)
     try:  # 异常捕获
@@ -233,8 +250,9 @@ def search():
         FruitVariety.name.like(f"%{q}%"),
         FruitVariety.category.like(f"%{q}%")
         )
-    ).all()
-    pagination = FruitVariety.query.paginate(page = page, per_page = per_page, error_out = False)
+    )
+    # 对搜索出来的结果进行分页
+    pagination = results.paginate(page = page, per_page = per_page, error_out = False)
     return success({
         'results':[r.to_dict() for r in results],
         'current_page':page,
