@@ -12,6 +12,8 @@ from models import db
 from flask_migrate import Migrate
 from dotenv import load_dotenv
 from datetime import timedelta
+import redis   # 用于连接和操作 Redis 数据库
+from sms import random, verify_sms_code, send_sms_code
 
 #初始化flask应用
 app = Flask(__name__)
@@ -19,12 +21,37 @@ load_dotenv()  # 自动从 .env 读取变量到 os.environ
 
 # 配置信息
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY'  ) 
-app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get(
-    'DATABASE_URL',
-    'sqlite:///FruitAndVegetable.db'  # 如果没设置 DATABASE_URL，默认用 SQLite
-)
+
+db_url = os.environ.get('DATABASE_URL')
+if not db_url:
+    raise ValueError("❌ 错误：未找到 DATABASE_URL 环境变量！请检查 .env 文件或 Docker 容器状态。")
+    
+app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['DEBUG'] = os.environ.get('DEBUG', 'False').lower() == 'true'
+# reids配置信息
+redis_host = os.environ.get('REDIS_HOST')
+redis_port = int(os.environ.get('REDIS_PORT'))
+redis_password = os.environ.get('REDIS_PASSWORD')  # 从 .env 获取密码
+# redis连接情况
+try:
+    redis_client = redis.Redis(
+        host=redis_host,
+        port=redis_port,
+        password=redis_password,  # 传入密码
+        decode_responses=True,
+        socket_connect_timeout=5
+    )
+    # 启动时测试连接
+    if redis_client.ping():
+        print(f"✅ Redis 连接成功: {redis_host}:{redis_port}")
+    else:
+        print("⚠️ Redis Ping 无响应")
+        redis_client = None
+except Exception as e:
+    print(f"❌ Redis 连接失败: {e}")
+    redis_client = None
+
 # 用户一小时为操作自动登出
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=1) 
 
@@ -106,6 +133,8 @@ def index():
         }
     })
 
+
+
 # 登录功能
 @app.route('/api/login', methods = ['POST'])
 def login():
@@ -152,29 +181,105 @@ def logout():
     logout_user()
     return success(message='已登出')
 
+# 验证码发送功能   
+@app.route('/api/sms/send', methdos = ['POST'])
+def send_sms():
+    current_phone = current_user.account
+    if not current_phone:
+        return error(message='当前用户未绑定手机号，无法发送验证码', code=400)
+    debug_mode = os.environ.get('DEBUG', 'False').lower() == 'true'
+    result = send_sms_code(phone=current_phone, redis_client=redis_client, debug_mode=debug_mode)
+    if result['success']:
+        return success(data={'debug_code': result.get('debug_code')}, message=result['message'])
+    else:
+        # 失败则返回对应的错误码（如 400 或 500）
+        # 这里简单处理，统一返回 400，你也可以根据具体 message 区分
+        return error(result['message'], 400)
+
+# 验证码检查功能
+@app.route('/api/sms/verify', methods=['POST'])
+def verify_sms():
+    """
+    校验短信验证码接口
+    通常用于注册、找回密码等场景
+    """
+    data = request.get_json()
+    if not data:
+        return error('请求数据不能为空', 400)
+        
+    phone = data.get('phone')
+    code = data.get('code')
+    
+    if not phone or not code:
+        return error('手机号和验证码不能为空', 400)
+
+    # 调用 sms.py 中的校验逻辑
+    result = verify_sms_code(phone=phone, input_code=code, redis_client=redis_client)
+    
+    if result['success']:
+        return success(message=result['message'])
+    else:
+        return error(result['message'], 400)
+
+
+
 # 注销(删除账号)功能
 @app.route('/api/delete-account', methods = ['DELETE'])
 @login_required
 def delete_account():
-    password_3 = request.args.get('password')
+    data  = request.get_json()
+    verify_method = data.get('verify_method')# password 或者sms
+
     user_delete = Users.query.get(current_user.id)
 
     if not user_delete:
         return error(message='用户不存在', code=404)
-    # 密码验证
-    if not password_3 or not check_password_hash(current_user.password, password_3):
-        return error(message= '密码验证失败，无法注销账号', code = 400)
+    # 分支验证
+    verify = False
+    if verify_method == 'password':
+        password = data.get('password')
+        # 密码验证
+        if not password :
+            return error(message= '请输入密码', code = 400)
+        if check_password_hash(user_delete.password, password):
+            verify = True
+        else:
+            return error(message='密码错误，验证失败', code=400)
 
+        
+    elif verify_method == 'sms':
+        sms_code = data.get('sms_code')
+        if not sms_code:
+            return error(message= '请输入验证码', code = 400)
+        else:
+            sms_result = verify_sms_code(
+            phone=current_user.account, 
+            input_code=sms_code, 
+            redis_client=redis_client
+        )
+        
+        if sms_result.get('success'):
+            verify = True
+        else:
+            return error(message=sms_result.get('message', '验证码无效'), code=400)
+        
+    else:
+        return error(message='不支持的验证方式 (仅支持 password 或 sms)', code=400)     
+       
+    if verify:
     # 尝试删除账号
-    try:
-        db.session.delete(user_delete)
-        db.session.commit()
-        # 验证成功后，先清理账号后登出
-        logout_user()
-        return success(message='账号注销成功')
-    except Exception as e:
-        db.session.rollback() # 撤销工作台里所有未提交的操作，恢复到操作前的状态
-        return error(message=f'账号注销失败:{str(e)}',code = 500)
+        try:
+            db.session.delete(user_delete)
+            db.session.commit()
+            # 验证成功后，先清理账号后登出
+            logout_user()
+            return success(message='账号注销成功')
+        except Exception as e:
+            db.session.rollback() # 撤销工作台里所有未提交的操作，恢复到操作前的状态
+            return error(message=f'账号注销失败:{str(e)}',code = 500)
+            
+    
+    
 
 
 # 密码修改功能
@@ -182,23 +287,64 @@ def delete_account():
 @login_required
 def change_password():
     data = request.get_json()
-    old_password = data.get('old_password')
     new_password = data.get('new_password')
+    verify_method = data.get('verify_method')# password 或者sms
+    
     # 密码验证
     if not new_password:
         return error(message= '新密码不能为空', code = 400)
     if not validate_password(new_password):
         return error(message= '密码必须为8位，且包含大小写字母和数字', code = 400)
-    if not old_password or not check_password_hash(current_user.password, old_password):
-        return error(message= '密码验证失败，无法修改密码', code = 400)
-    try:  # 异常捕获
-        current_user.password = generate_password_hash(new_password)
-        db.session.commit()
-        logout_user()
-        return success(message='密码修改成功，请重新登录')
-    except Exception as e:
-        db.session.rollback()
-        return error(message=f'密码修改失败：{str(e)}', code=500)
+
+    # 分支验证
+    verify = False
+    user = Users.query.get(current_user.id)
+    if not user:
+        return error(message='用户不存在', code=404)
+    if verify_method == 'password':
+        old_password = data.get('old_password')
+        # 密码验证
+        if not old_password :
+            return error(message= '请输入旧密码', code = 400)
+        if check_password_hash(user.password, old_password):
+            verify = True
+        else:
+            return error(message='密码错误，验证失败', code=400)
+
+        
+    elif verify_method == 'sms':
+        sms_code = data.get('sms_code')
+        if not sms_code:
+            return error(message= '请输入验证码', code = 400)
+        else:
+            sms_result = verify_sms_code(
+            phone=user.account, 
+            input_code=sms_code, 
+            redis_client=redis_client
+        )
+        
+        if sms_result.get('success'):
+            verify = True
+        else:
+            return error(message=sms_result.get('message', '验证码无效'), code=400)
+        
+    else:
+        return error(message='不支持的验证方式 (仅支持 password 或 sms)', code=400)     
+       
+    if verify:
+    
+        try:  # 异常捕获
+            current_user.password = generate_password_hash(new_password)
+            db.session.commit()
+            logout_user()
+            return success(message='密码修改成功，请重新登录')
+        except Exception as e:
+            db.session.rollback()
+            return error(message=f'密码修改失败', code=500)
+
+
+
+
 
 # 果蔬首页——已（未）登录
 @app.route('/api/fruits', methods = ['GET'])
