@@ -5,7 +5,7 @@
 """
 
 
-from flask import request, Flask, jsonify
+from flask import request, Flask, jsonify, g
 from flask_sqlalchemy import SQLAlchemy
 import os   #实现交互
 from models import db
@@ -52,8 +52,6 @@ except Exception as e:
     print(f"❌ Redis 连接失败: {e}")
     redis_client = None
 
-# 用户一小时为操作自动登出
-app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=1) 
 
 #初始化数据库
 db.init_app(app) # 复用models.py中的db实例
@@ -105,36 +103,87 @@ def validate_password(password:str)->bool:
         return False
     return True
 
+
+
+# 全局钩子，用于在每一次请求的时候验证token
+@app.before_request
+def check_auth_token():
+    # 跳过公开接口和登录注册等接口
+    if request.path in [
+       '/api/login', '/api/register', 
+       '/api/fruits', '/api/search'
+    ]:
+        return None
+    auth_header = request.headers.get('Authorization')
+    token = None
+    
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+    else:
+        # 兼容自定义 Header
+        token = request.headers.get('X-Session-Token')
+
+    if not token:   
+     return error('无认证', 401)    
+    
+    redis_key = f"session:{token}"
+    try:
+        # 在redis中查找对应内容，得到对应的唯一id
+        user_id_str = redis_client.get(redis_key)
+    except Exception as e:
+        print(f"[Error] Redis 读取失败: {e}")
+        return error('服务器内部错误', 500)
+    
+    try:
+        user_id = int(user_id_str)
+        user = Users.query.get(user_id)
+        if not user:
+            # 数据库中没有该用户（可能被删除），清理 Redis
+            redis_client.delete(redis_key)
+            return error('用户不存在', 401)
+        
+        # 将当前用户挂载到 flask.g 对象，供后续路由使用
+        g.current_user = user
+    except Exception as e:
+        return error('认证解析失败', 401)
+
+    return None
+
+
 # 路由设计
 
+# 根路由
 # 根路由
 @app.route('/')
 def index():
     return jsonify({
-        'message':"欢迎来到果蔬信息管理系统！",
-        'status':"running",
-        'endpoints':{
-
+        'message': "欢迎来到果蔬信息管理系统！",
+        'status': "running",
+        'endpoints': {
             # 用户相关
             "register": "/api/register (POST)",
             "login": "/api/login (POST)",
-            "logout": "/api/logout (POST)",
-            "change_password": "/api/change-password (PATCH)",
+            "logout": "/api/logout (POST) [需登录]",
+            "change_password": "/api/change-password (PATCH) [需登录]",
+            
+            # 短信验证 (新增)
+            "sms_send": "/api/sms/send (POST) [需登录] - 发送验证码",
+            "sms_verify": "/api/sms/verify (POST) [需登录] - 验证验证码",
             
             # 果蔬管理
             "fruits_list": "/api/fruits (GET) - 分页获取所有果蔬",
-            "fruits_create": "/api/fruits (POST) - 添加新果蔬（需登录）",
-            "fruit_detail": "/api/fruits/<id> (GET) - 查看单个果蔬详情（需登录）",
-            "fruit_update": "/api/fruits/<id> (PATCH) - 更新果蔬信息（需登录）",
-            "fruit_delete": "/api/fruits/<id> (DELETE) - 删除果蔬（需登录）",
+            "fruits_create": "/api/fruits (POST) [需登录] - 添加新果蔬",
+            "fruit_detail": "/api/fruits/<id> (GET) [需登录] - 查看详情",
+            "fruit_update": "/api/fruits/<id> (PATCH) [需登录] - 更新信息",
+            "fruit_delete": "/api/fruits/<id> (DELETE) [需登录] - 删除果蔬",
             
             # 搜索
             "search": "/api/search?q=关键词 (GET) - 模糊搜索名称或类别"
-        }
+        },
+        "tip": "需登录接口请在 Header 中携带: Authorization: Bearer <token>"
     })
 
-
-
+import secrets
 # 登录功能
 @app.route('/api/login', methods = ['POST'])
 def login():
@@ -145,9 +194,24 @@ def login():
     user = Users.query.filter_by(account = account_1).first()
     if user and check_password_hash(user.password, password_1):
         # 如果用户存在并且密码匹配正确
-        login_user(user)
-        return success({'user':user.to_dict()},'登录成功')
-    return error('账号或者密码错误',401)
+        # 生成 32 位随机 Token
+        session_token = secrets.token_hex(16)
+        # 存入到redis中
+        redis_key = f'session:{session_token}'
+        # 设置七天有效期
+        try:
+            redis_client.setex(redis_key, 7*24*3600,str(user.id) )
+        except Exception as e:
+            print(f"[Error] Redis 存储 Token 失败: {e}")
+            return error('服务器会话存储故障', 500)
+        
+        #返回 Token 给前端，不返回数据库 ID
+        return success({
+            'token': session_token,
+            'expires_in': '7 days',
+        }, '登录成功')
+        
+
                  
                 
 # 注册功能
@@ -158,11 +222,11 @@ def register():
     password = data.get('password')
 
     if not account or not password:
-        return error('账号和密码不能未空',400)
+        return error('账号和密码不能为空',400)
     if len(account) != 11 or not account.isdigit():
         return error("账号必须是11位数字", 400)
     if not validate_password(password):
-        return {"error": "密码必须为8位，且包含大小写字母和数字"}, 400
+        return error("密码必须为8位，且包含大小写字母和数字", 400)
     if Users.query.filter_by(account=account).first():
         return error("账号已存在", 409)        
              
@@ -175,18 +239,32 @@ def register():
     
 # 登出功能
 @app.route('/api/logout', methods = ['POST'])
-# 装饰器：必须登录才可以范文的路由，未登陆就进行跳转
-@login_required
 def logout():
-    logout_user()
-    return success(message='已登出')
+    # 前端需要在 Header 中带上 Token
+    auth_header = request.headers.get('Authorization')
+    token = None
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+    else:
+        token = request.headers.get('X-Session-Token')
+
+    if token:
+        redis_key = f"session:{token}"
+        try:
+            redis_client.delete(redis_key)
+        except Exception as e:
+            print(f"[Warning] 删除 Token 失败: {e}")
+    
+    return success(message='已登出')           
+           
 
 # 验证码发送功能   
-@app.route('/api/sms/send', methdos = ['POST'])
+@app.route('/api/sms/send', methods = ['POST'])
 def send_sms():
-    current_phone = current_user.account
-    if not current_phone:
-        return error(message='当前用户未绑定手机号，无法发送验证码', code=400)
+    if not g.current_user or not  hasattr(g, 'current_user'):
+        return error(message='请先登录', code=401)
+    current_phone = g.current_user.account
+
     debug_mode = os.environ.get('DEBUG', 'False').lower() == 'true'
     result = send_sms_code(phone=current_phone, redis_client=redis_client, debug_mode=debug_mode)
     if result['success']:
@@ -199,6 +277,8 @@ def send_sms():
 # 验证码检查功能
 @app.route('/api/sms/verify', methods=['POST'])
 def verify_sms():
+    if not hasattr(g, 'current_user') or not g.current_user:
+        return error(message='请先登录', code=401)
     """
     校验短信验证码接口
     通常用于注册、找回密码等场景
@@ -207,11 +287,11 @@ def verify_sms():
     if not data:
         return error('请求数据不能为空', 400)
         
-    phone = data.get('phone')
+    phone = g.current_user.account
     code = data.get('code')
     
-    if not phone or not code:
-        return error('手机号和验证码不能为空', 400)
+    if not code:
+        return error('验证码不能为空', 400)
 
     # 调用 sms.py 中的校验逻辑
     result = verify_sms_code(phone=phone, input_code=code, redis_client=redis_client)
@@ -225,12 +305,13 @@ def verify_sms():
 
 # 注销(删除账号)功能
 @app.route('/api/delete-account', methods = ['DELETE'])
-@login_required
 def delete_account():
+    if not hasattr(g, 'current_user') or not g.current_user:
+        return error(message='请先登录', code=401)
     data  = request.get_json()
     verify_method = data.get('verify_method')# password 或者sms
 
-    user_delete = Users.query.get(current_user.id)
+    user_delete = g.current_user
 
     if not user_delete:
         return error(message='用户不存在', code=404)
@@ -253,7 +334,7 @@ def delete_account():
             return error(message= '请输入验证码', code = 400)
         else:
             sms_result = verify_sms_code(
-            phone=current_user.account, 
+            phone=g.current_user.account, 
             input_code=sms_code, 
             redis_client=redis_client
         )
@@ -269,10 +350,12 @@ def delete_account():
     if verify:
     # 尝试删除账号
         try:
+            auth_header = request.headers.get('Authorization')
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.split(" ")[1]
+                redis_client.delete(f"session:{token}")
             db.session.delete(user_delete)
             db.session.commit()
-            # 验证成功后，先清理账号后登出
-            logout_user()
             return success(message='账号注销成功')
         except Exception as e:
             db.session.rollback() # 撤销工作台里所有未提交的操作，恢复到操作前的状态
@@ -284,8 +367,9 @@ def delete_account():
 
 # 密码修改功能
 @app.route('/api/change-password',methods = ['PATCH'])
-@login_required
 def change_password():
+    if not hasattr(g, 'current_user') or not g.current_user:
+        return error(message='请先登录', code=401)
     data = request.get_json()
     new_password = data.get('new_password')
     verify_method = data.get('verify_method')# password 或者sms
@@ -298,7 +382,7 @@ def change_password():
 
     # 分支验证
     verify = False
-    user = Users.query.get(current_user.id)
+    user = g.current_user
     if not user:
         return error(message='用户不存在', code=404)
     if verify_method == 'password':
@@ -334,9 +418,13 @@ def change_password():
     if verify:
     
         try:  # 异常捕获
-            current_user.password = generate_password_hash(new_password)
+            user.password = generate_password_hash(new_password)
             db.session.commit()
-            logout_user()
+            # 删除已有的token要求重新登录
+            auth_header = request.headers.get('Authorization')
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.split(" ")[1]
+                redis_client.delete(f"session:{token}")
             return success(message='密码修改成功，请重新登录')
         except Exception as e:
             db.session.rollback()
@@ -368,8 +456,9 @@ def get_fruits_and_vegetables():
 
 # 果蔬详情页
 @app.route('/api/fruits/<int:fruit_id>', methods = ['GET'])
-@login_required
 def fruit_details(fruit_id):
+    if not hasattr(g, 'current_user') or not g.current_user:
+        return error(message='请先登录', code=401)
     fruit = FruitVariety.query.get_or_404(fruit_id)
     data = fruit.to_dict()
     return success(data)
@@ -381,15 +470,16 @@ def search():
     # 从前端获取要查询的果蔬名称关键词
     q = request.args.get('q','').strip()
     page = request.args.get('page',1,type=int)
-    per_page = request.args.get('pre_page',10,type = int)
+    per_page = request.args.get('per_page',10,type = int)
 
     if not q:
         return success({
             'results': [],
             'current_page':page,
             'pages':0,
-            'total':0
-            
+            'total':0,
+            'has_next': False,   
+            'has_prev': False 
             })
     results = FruitVariety.query.filter(
         or_(
@@ -400,7 +490,7 @@ def search():
     # 对搜索出来的结果进行分页
     pagination = results.paginate(page = page, per_page = per_page, error_out = False)
     return success({
-        'results':[r.to_dict() for r in results],
+        'results':[r.to_dict() for r in pagination.items],
         'current_page':page,
         'pages':pagination.pages,
         'total':pagination.total,
@@ -410,8 +500,10 @@ def search():
 
 # 种类添加功能
 @app.route('/api/fruits', methods = ['POST'])
-@login_required
 def add_fruits():
+    if not hasattr(g, 'current_user') or not g.current_user:
+        return error(message='请先登录', code=401)
+
     data = request.get_json()
     category = data.get('category')
     name = data.get('name')
@@ -441,8 +533,9 @@ def add_fruits():
 
 # 种类删除功能
 @app.route('/api/fruits/<int:fruit_id>', methods = ['DELETE'])
-@login_required
 def delete_fruit(fruit_id):
+    if not hasattr(g, 'current_user') or not g.current_user:
+        return error(message='请先登录', code=401)
     fruit = FruitVariety.query.get_or_404(fruit_id)
     try:
         if fruit.detail:
@@ -457,8 +550,9 @@ def delete_fruit(fruit_id):
 
 # 种类内容修改功能
 @app.route('/api/fruits/<int:fruit_id>',methods = ['PATCH'])
-@login_required
 def change_detail(fruit_id):
+    if not hasattr(g, 'current_user') or not g.current_user:
+        return error(message='请先登录', code=401)
     fruit = FruitVariety.query.get_or_404(fruit_id)
     data = request.get_json()
 
